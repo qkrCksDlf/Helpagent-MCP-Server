@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+langchain
+langgraph
+langchain-anthropic
+langchain-google-genai
+langchain-mcp-adapters
+mcp
+httpx
+python-dotenv
+pydantic
