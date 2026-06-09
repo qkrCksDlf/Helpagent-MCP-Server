@@ -34,6 +34,10 @@ SYSTEM_PROMPT = """당신은 디지털 취약계층(어르신 등)을 위한 도
 도구 이름(find_transit_route, get_current_weather, search_blog 등)을 절대 intent에 넣지 마세요.
 도구는 호출만 하고, 결과를 받은 후 항상 intent="chat"으로 답변하세요.
 
+⚠️ 길찾기 질문에는 절대 당신의 지식으로 경로를 지어내지 마세요.
+출발지·도착지가 있으면 무조건 find_transit_route 도구를 먼저 호출해야 합니다.
+도구 없이 역 이름이나 버스 번호를 직접 답하면 안 됩니다.
+
 잘못된 예: {"intent": "find_transit_route", ...}  ❌ 절대 금지!
 올바른 예: {"intent": "chat", "msg": "강남역에서 홍대까지 2호선으로 18분이에요"}  ✅
 
@@ -51,10 +55,15 @@ SYSTEM_PROMPT = """당신은 디지털 취약계층(어르신 등)을 위한 도
    - "내일 날씨", "이번 주", "주말" → get_daily_forecast
    - "오후", "저녁", "몇 시쯤" → get_hourly_forecast
 
-2. 길찾기는 find_transit_route(start, end) 호출:
-   - "어떻게 가?", "가는 길", "타고 가" 등
-   - 출발지나 도착지가 부족하면 도구 호출 말고 intent="chat"으로 물어보세요.
-   - 이전 대화에서 정보가 있으면 활용하세요.
+2. 길찾기 질문(가는 법, 어떻게 가, 경로, 가려면 등):
+   - 출발지와 도착지가 **둘 다 있으면 반드시 find_transit_route(start, end) 도구를 호출하세요.**
+   - 절대 당신의 지식으로 경로를 지어내지 마세요. 역 이름, 버스 번호, 노선, 소요시간을
+     추측해서 답하는 것은 금지입니다. 반드시 도구 결과만 사용하세요.
+   - 출발지나 도착지가 없을 때만 도구 없이 intent="chat"으로 되물어보세요.
+   - 이전 대화에 출발지/도착지 정보가 있으면 합쳐서 도구를 호출하세요.
+   - 장소 이름이 모호하면(예: "롯데월드") 사용자가 말한 그대로 도구에 넘기세요.
+   - 출발지가 "@현재위치@..." 형식으로 주어지면 그 값을 **그대로** start 에 넣어 도구를 호출하세요.
+     (이것은 GPS 현재 위치 좌표이므로 절대 수정하거나 다른 장소명으로 바꾸지 마세요.)
 
 3. 검색이 필요한 질문:
    - 맛집, 후기, 리뷰, 여행 → search_blog
@@ -180,6 +189,62 @@ def parse_json_response(text: str) -> dict:
         }
 
 
+def _extract_tool_result(msg, tool_name: str) -> dict | None:
+    """ToolMessage 에서 특정 도구의 결과(dict)를 꺼낸다."""
+    if msg.__class__.__name__ != "ToolMessage":
+        return None
+    if getattr(msg, "name", "") != tool_name:
+        return None
+
+    content = msg.content
+    # ToolMessage.content 는 문자열이거나 [{"type":"text","text":"..."}] 형태
+    if isinstance(content, list):
+        text = "".join(
+            b.get("text", "") if isinstance(b, dict) else str(b)
+            for b in content
+        )
+    else:
+        text = str(content)
+
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+_MODE_LABEL = {"subway": "지하철", "bus": "버스", "walk": "도보"}
+
+
+def _summarize_route(route: dict) -> str:
+    """길찾기 구조 데이터를 어르신용 짧은 한 줄 요약으로 (음성 안내/말풍선 백업용)."""
+    routes = route.get("routes", [])
+    if not routes:
+        return f"{route.get('from','출발지')}에서 {route.get('to','도착지')}까지 경로를 찾지 못했어요."
+
+    best = routes[0]
+    frm = route.get("from", "출발지")
+    to = route.get("to", "도착지")
+    total = best.get("total_time_min")
+    transfers = best.get("transfer_count", 0)
+
+    parts = [f"{frm}에서 {to}까지"]
+    if total:
+        parts.append(f"약 {total}분")
+    if transfers:
+        parts.append(f"환승 {transfers}번")
+    head = ", ".join(parts) + " 걸려요."
+
+    # 교통수단만 순서대로 (도보 제외하고 핵심 탈것만)
+    rides = [s for s in best.get("steps", []) if s.get("mode") in ("subway", "bus")]
+    if rides:
+        seq = " → ".join(
+            f"{s.get('line','')} {_MODE_LABEL.get(s.get('mode'),'')}".strip()
+            for s in rides
+        )
+        head += f" {seq} 순서로 타시면 돼요."
+    return head
+
+
 async def run_agent(user_message: str, session_id: str = "default") -> dict:
     try:
         agent = await get_agent()
@@ -219,6 +284,32 @@ async def run_agent(user_message: str, session_id: str = "default") -> dict:
                 print(f"    ↩️ 도구 결과 ({tool_name})")
         print("=" * 60)
 
+        # 🌟 길찾기 결과 가로채기:
+        #    find_transit_route 가 성공(routes 존재)했으면 LLM 요약을 버리고
+        #    구조화 데이터를 그대로 안드로이드로 패스스루한다.
+        #    (LLM 이 경로를 줄글로 뭉개는 걸 방지 → 카드 UI 로 렌더 가능)
+        for msg in all_messages:
+            route = _extract_tool_result(msg, "find_transit_route")
+            if route and route.get("routes"):
+                summary = _summarize_route(route)
+                print(f"🗺️ 길찾기 구조화 응답으로 직접 반환 (LLM 요약 건너뜀)")
+
+                # 히스토리에는 요약 한 줄만 남겨 맥락 유지 (구조 데이터는 부담되니 제외)
+                final_ai_message = AIMessage(content=summary)
+                new_history = history + [new_message, final_ai_message]
+                if len(new_history) > MAX_HISTORY:
+                    new_history = new_history[-MAX_HISTORY:]
+                _sessions[session_id] = new_history
+
+                return {
+                    "intent": "transit_route",
+                    "query": f"{route.get('from','')} → {route.get('to','')}",
+                    "msg": summary,
+                    "route": route,
+                }
+            # 길찾기는 호출했는데 실패(error)한 경우는 가로채지 않고
+            # LLM 이 웹검색 fallback 등으로 답하도록 그대로 둔다.
+
         final_text = all_messages[-1].content if all_messages else ""
         if isinstance(final_text, list):
             final_text = "".join(
@@ -246,6 +337,7 @@ async def run_agent(user_message: str, session_id: str = "default") -> dict:
             "intent": parsed.get("intent", "chat"),
             "query": parsed.get("query", ""),
             "msg": parsed.get("msg", ""),
+            "route": None,
         }
 
     except Exception as e:
