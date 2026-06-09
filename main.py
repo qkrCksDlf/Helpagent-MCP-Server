@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Any, Optional
 from agent import run_agent, reset_session
 
 app = FastAPI()
@@ -22,6 +23,8 @@ class ChatResponse(BaseModel):
     intent: str
     query: str
     msg: str
+    # 🌟 길찾기 결과 구조화 데이터 (intent="transit_route" 일 때만 채워짐)
+    route: Optional[dict[str, Any]] = None
 
 
 class ResetRequest(BaseModel):
