@@ -7,79 +7,132 @@ LangGraph 에이전트 (대화 히스토리 지원)
 import os
 import json
 import re
+import contextvars
 from pathlib import Path
 from dotenv import load_dotenv
 
 from langchain_anthropic import ChatAnthropic
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
+from langchain_core.tools import StructuredTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt import create_react_agent
 
 load_dotenv()
 
-SYSTEM_PROMPT = """당신은 디지털 취약계층(어르신 등)을 위한 도우미입니다.
-
-【중요】 반드시 JSON 형식으로만 응답하세요. 다른 텍스트는 절대 포함하지 마세요.
-코드블록(```)도 쓰지 마세요. 순수 JSON만 출력하세요.
-
-응답 형식:
+SYSTEM_PROMPT = """당신은 디지털 기기가 낯선 어르신을 돕는 친절한 AI 도우미입니다. 어려운 IT 용어와 외래어를 피하고, 짧고 다정한 말투(~해요)로 답하세요.
+ 
+【도구 사용】
+- 기본은 도구 호출입니다. 사실을 확인해야 하는 질문(날씨, 길찾기, 요리법, 용어, 상식, 최신 정보, 제품·장소)은 내장 지식으로 추측하지 말고 반드시 도구를 먼저 부른 뒤 결과를 받아 답하세요.
+- 아래 네 가지만 도구 없이 바로 답합니다. 목록에 없으면 도구를 씁니다.
+  인사·감사·감정 응대 / 도우미 자신에 대한 질문 / 산수 / 농담·이야기 창작
+ 
+【출력 형식: 절대 규칙】
+JSON 한 줄만 출력하세요. 코드블록이나 부연 설명 금지.
 {"intent": "...", "query": "...", "msg": "한국어 답변"}
+intent 는 셋 중 하나만: "chat" | "buy_product" | "book_ktx"
+도구 이름을 intent 에 적지 마세요.
+ 
+【intent 판정】
+- "사줘/주문해줘/시켜줘/구매해줘" 또는 "떨어졌다/다 썼다" → intent="buy_product". 되묻지 말고, query 에는 상품명만 담으세요. (예: "쿠팡에서 햄버거 사줘" → query="햄버거")
+- 기차·KTX·SRT 예매/예약 → intent="book_ktx". 출발지·날짜가 없어도 되묻지 마세요.
+- 가격이나 리뷰가 궁금한 것뿐이면 구매가 아닙니다. search_shop 호출 후 intent="chat".
+- 구매·예매가 다른 요청과 섞이면 구매·예매를 우선하세요. 화면이 전환되어 다른 답변은 보이지 않으므로 msg 에는 짧은 안내만 담습니다.
+ 
+【도구 선택】
+- 길찾기: 출발지와 도착지가 모두 있을 때만 find_transit_route(start, end) 호출. 사용자가 말한 장소 이름을 그대로 넣고 근처 상호로 바꾸지 마세요. 안내는 가장 빠른 경로 하나만 단계별로.
+- 날씨: 지금·오늘 → get_current_weather / 내일·주말·이번 주 → get_daily_forecast / 오후·저녁·특정 시간 → get_hourly_forecast
+- 검색: 맛집·후기 → search_blog / 뉴스 → search_news / 상품 가격 → search_shop / 그 외 모든 사실 질문 → search_web. 검색어에 사용자가 말한 핵심 키워드를 반드시 포함하고, 결과는 2~3개만 요약하세요.
+ 
+【길찾기 출발지 예외】
+길찾기에 한해, 출발지를 모르면 도구를 부르지 말고 intent="chat" 으로 "어디에서 출발하실까요?" 하고 먼저 여쭤보세요.
+- "@현재위치@위도,경도" 가 메시지에 실제로 있으면 그 문자열을 한 글자도 고치지 말고 그대로 start 에 넣습니다.
+- 태그가 없으면 좌표를 지어내거나 "현재 위치"·"여기"·"내 위치" 같은 말을 넣지 마세요.
+- 구매·예매의 되묻지 않기 규칙은 길찾기에 적용되지 않습니다.
+- 이 예외는 길찾기에만 적용됩니다. 다른 질문은 【도구 사용】 기본 규칙대로 도구를 부르세요.
+ 
+【맥락】
+이전 대화의 장소·주제를 기억하고 단답형 발화도 문맥에 연결하세요. 직전이 구매·예매 흐름이면 "그걸로 해줘" 같은 후속도 같은 intent 로 이어갑니다."""
 
-⚠️ intent는 반드시 다음 셋 중 하나만 사용하세요:
-- "chat"  (대화, 정보 안내, 날씨/길찾기/검색 결과 안내, 추가 정보 요청)
-- "buy_product"  (쇼핑 요청)
-- "book_ktx"  (기차 예매)
 
-도구 이름(find_transit_route, get_current_weather, search_blog 등)을 절대 intent에 넣지 마세요.
-도구는 호출만 하고, 결과를 받은 후 항상 intent="chat"으로 답변하세요.
+# ─────────────────────────────────────────────────────────────
+# 길찾기 출발지 가드
+#
+# 배경: 홀드아웃 평가에서 "인하대 갈라믄 어떻게 가?" 처럼 출발지가 없는 질문에
+#       모델이 start="@현재위치@37.5665,126.9780" 을 스스로 만들어 넣는 사례가 나왔다.
+#       (해당 좌표는 서울시청. 앱이 준 GPS 가 아니라 모델이 지어낸 값)
+#       형식이 완벽해서 하위 로직은 정상 GPS 로 인식하고, 엉뚱한 출발지의 경로가
+#       아무 경고 없이 안내된다. 사용자는 틀린 줄 알 수 없다.
+#
+# 프롬프트로 금지해도 모델이 어긴 사례이므로, 코드에서 결정적으로 막는다.
+# 프롬프트는 1차 방어, 이 가드가 최종 방어다.
+# ─────────────────────────────────────────────────────────────
+GPS_TAG = "@현재위치@"
 
-⚠️ 길찾기 질문에는 절대 당신의 지식으로 경로를 지어내지 마세요.
-출발지·도착지가 있으면 무조건 find_transit_route 도구를 먼저 호출해야 합니다.
-도구 없이 역 이름이나 버스 번호를 직접 답하면 안 됩니다.
+# 출발지 자리에 들어오면 안 되는 자리표시자 (공백 제거 후 비교)
+_PLACEHOLDER_ORIGINS = {
+    "현재위치", "현위치", "지금위치", "내위치", "여기", "현재장소", "출발지", "현재지",
+}
 
-잘못된 예: {"intent": "find_transit_route", ...}  ❌ 절대 금지!
-올바른 예: {"intent": "chat", "msg": "강남역에서 홍대까지 2호선으로 18분이에요"}  ✅
+# 이번 요청의 사용자 메시지에 실제 GPS 태그가 있었는지
+_gps_available = contextvars.ContextVar("gps_available", default=False)
 
-【대화 맥락 유지】
-이전 대화 내용을 기억하고 활용하세요.
-사용자가 이전 질문에 대한 답변을 이어서 하는 경우 자연스럽게 연결하세요.
-예시:
-- 이전 AI: "어디에서 출발하세요?"
-- 현재 사용자: "인하대학교에서요"
-- → 이전 도착지와 합쳐서 find_transit_route 호출
 
-규칙:
-1. 날씨를 물으면 적절한 날씨 도구 호출:
-   - "지금 날씨", "오늘 날씨" → get_current_weather
-   - "내일 날씨", "이번 주", "주말" → get_daily_forecast
-   - "오후", "저녁", "몇 시쯤" → get_hourly_forecast
+def set_gps_context(user_message: str) -> bool:
+    """
+    요청 시작 시 호출. 사용자 메시지에 실제 GPS 태그가 있었는지 기록한다.
+    호출하지 않으면 기본값 False(가드 활성)이라 안전한 쪽으로 동작한다.
+    """
+    has_tag = GPS_TAG in (user_message or "")
+    _gps_available.set(has_tag)
+    return has_tag
 
-2. 길찾기 질문(가는 법, 어떻게 가, 경로, 가려면 등):
-   - 출발지와 도착지가 **둘 다 있으면 반드시 find_transit_route(start, end) 도구를 호출하세요.**
-   - 절대 당신의 지식으로 경로를 지어내지 마세요. 역 이름, 버스 번호, 노선, 소요시간을
-     추측해서 답하는 것은 금지입니다. 반드시 도구 결과만 사용하세요.
-   - 출발지나 도착지가 없을 때만 도구 없이 intent="chat"으로 되물어보세요.
-   - 이전 대화에 출발지/도착지 정보가 있으면 합쳐서 도구를 호출하세요.
-   - 장소 이름이 모호하면(예: "롯데월드") 사용자가 말한 그대로 도구에 넘기세요.
-   - 출발지가 "@현재위치@..." 형식으로 주어지면 그 값을 **그대로** start 에 넣어 도구를 호출하세요.
-     (이것은 GPS 현재 위치 좌표이므로 절대 수정하거나 다른 장소명으로 바꾸지 마세요.)
 
-3. 검색이 필요한 질문:
-   - 맛집, 후기, 리뷰, 여행 → search_blog
-   - 뉴스, 사건, 최신 소식 → search_news
-   - 상품, 가격, 쇼핑 정보 → search_shop
-   - 일반 정보, 정의, 지식 → search_web
+def _origin_rejection(start: str, reason: str) -> str:
+    print(f"🛑 [출발지 가드] 차단: start={start!r} ({reason})", file=__import__("sys").stderr)
+    return json.dumps({
+        "error": "NO_ORIGIN",
+        "reason": reason,
+        "instruction": (
+            "출발지를 확인할 수 없습니다. 도구를 다시 부르지 말고, "
+            "사용자에게 어디에서 출발하시는지 여쭤보세요. "
+            "현재 위치나 좌표를 임의로 지어내면 안 됩니다."
+        ),
+    }, ensure_ascii=False)
 
-4. 도구 결과를 받으면 intent="chat"으로 자연스럽게 답변:
-   - 답변은 짧고 친절하게, 어르신도 이해하기 쉽게
-   - 검색 결과가 많으면 2-3개만 골라서 안내
-   - 길찾기는 가장 빠른 경로 하나만 단계별로 안내
 
-5. 쇼핑/기차 요청이면 도구 호출 없이 바로 해당 intent 반환:
-   - 쇼핑 → intent="buy_product", query=상품명
-   - 기차 → intent="book_ktx"
-"""
+def _check_origin(start: str) -> str | None:
+    """차단해야 하면 도구 결과로 돌려줄 JSON 문자열, 통과면 None."""
+    raw = str(start or "")
+    if GPS_TAG in raw and not _gps_available.get():
+        return _origin_rejection(raw, "사용자 메시지에 없던 GPS 태그를 모델이 생성함")
+    if not raw.startswith(GPS_TAG):
+        squashed = re.sub(r"\s+", "", raw)
+        if squashed in _PLACEHOLDER_ORIGINS:
+            return _origin_rejection(raw, "실제 장소가 아닌 자리표시자")
+        if not squashed:
+            return _origin_rejection(raw, "출발지가 비어 있음")
+    return None
+
+
+def _wrap_transit_guard(tool):
+    """find_transit_route 를 감싸 출발지를 검증한다. 실패하면 원본을 그대로 쓴다."""
+    try:
+        async def _guarded(**kwargs):
+            blocked = _check_origin(kwargs.get("start"))
+            if blocked:
+                return blocked
+            return await tool.ainvoke(kwargs)
+
+        return StructuredTool(
+            name=tool.name,
+            description=tool.description,
+            args_schema=tool.args_schema,
+            coroutine=_guarded,
+        )
+    except Exception as e:
+        print(f"⚠️ 출발지 가드 적용 실패, 원본 도구 사용: {e}")
+        return tool
 
 
 def build_llm():
@@ -94,9 +147,10 @@ def build_llm():
             temperature=0.2,
         )
     elif provider == "gemini":
-        print("🤖 Using Gemini 3.5 Flash")
+        model_name = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+        print(f"🤖 Using {model_name}")
         return ChatGoogleGenerativeAI(
-            model="gemini-3.1-flash-lite",
+            model=model_name,
             google_api_key=os.getenv("GOOGLE_API_KEY"),
             temperature=0.2,
         )
@@ -145,6 +199,9 @@ async def get_agent():
         },
     })
     tools = await client.get_tools()
+
+    # 길찾기 도구에만 출발지 가드를 씌운다
+    tools = [_wrap_transit_guard(t) if t.name == "find_transit_route" else t for t in tools]
 
     print(f"🛠️ 등록된 도구 수: {len(tools)}")
     for tool in tools:
@@ -248,6 +305,10 @@ def _summarize_route(route: dict) -> str:
 async def run_agent(user_message: str, session_id: str = "default") -> dict:
     try:
         agent = await get_agent()
+
+        # 🌟 이번 요청에 실제 GPS 태그가 있었는지 기록 (출발지 가드가 참조)
+        has_gps = set_gps_context(user_message)
+        print(f"📍 GPS 태그 {'있음' if has_gps else '없음'}")
 
         # 🌟 세션 히스토리 가져오기
         history = _sessions.get(session_id, [])
