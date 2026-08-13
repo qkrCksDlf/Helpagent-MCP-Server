@@ -51,7 +51,7 @@ async def _search_place(name: str) -> dict | None:
     query = f"{name} 지하철역" if is_station_query else name
 
     # 후보를 여러 개 받아서 이름·카테고리로 더 그럴듯한 장소를 고른다.
-    params = {"query": query, "display": 5, "sort": "comment"}
+    params = {"query": query, "display": 5, "sort": "random"}
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(NAVER_LOCAL_URL, headers=headers, params=params)
